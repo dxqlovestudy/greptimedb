@@ -48,7 +48,9 @@ including caches owned by pipeline and protocol handlers.
 - **Insert** (`instance/grpc.rs`): `handle_inserts` / `handle_row_inserts` →
   `check_permission` → `operator`'s `Inserter` (schema validation, optional
   auto-create, partition routing, meter admission) → local `RegionServer`
-  (standalone) or RPC to datanodes (distributed). Arrow bulk inserts pass the
+  (standalone) or RPC to datanodes (distributed). `FrontendBuilder` configures
+  the operator write dispatcher with frontend retry options for distributed
+  inserts, deletes, and bulk writes. Arrow bulk inserts pass the
   request channel to `Inserter` and check meter admission for each nonempty batch.
 - Finite ingestion requests split internally admit their total rows per database
   before dispatch (`operator::insert::admit_write` / `admit_row_insert_batches`).

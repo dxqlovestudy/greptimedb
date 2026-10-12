@@ -512,10 +512,11 @@ impl StartCommand {
             cached_meta_backend.clone(),
             layered_cache_registry.clone(),
             catalog_manager,
-            client,
+            client.clone(),
             meta_client.clone(),
             process_manager,
-        );
+        )
+        .with_write_retry_clients(client);
 
         plugins::setup_frontend_plugins_post_build(&mut plugins, &plugin_opts, &builder)
             .await

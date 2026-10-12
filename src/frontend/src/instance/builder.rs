@@ -21,11 +21,14 @@ use catalog::CatalogManagerRef;
 use catalog::kvbackend::KvBackendCatalogManager;
 use catalog::process_manager::ProcessManagerRef;
 use catalog::system_schema::semantic_graph::EntityGraphProviderRef;
+use client::client_manager::NodeClients;
 use common_base::Plugins;
 use common_batcher::request_limiter::RequestLimiter;
 use common_datasource::object_store::LocalFileAccess;
 use common_event_recorder::{EventRecorderImpl, EventRecorderRef};
-use common_meta::cache::{LayeredCacheRegistryRef, TableFlownodeSetCacheRef, TableRouteCacheRef};
+use common_meta::cache::{
+    LayeredCacheRegistryRef, TableFlownodeSetCacheRef, TableInfoCacheRef, TableRouteCacheRef,
+};
 use common_meta::cache_invalidator::{CacheInvalidatorRef, DummyCacheInvalidator};
 use common_meta::key::TableMetadataManager;
 use common_meta::key::flow::FlowMetadataManager;
@@ -46,6 +49,7 @@ use operator::statement::{
     StatementExecutor, StatementExecutorConfiguratorRef, StatementExecutorRef,
 };
 use operator::table::TableMutationOperator;
+use operator::write_dispatcher::WriteDispatcher;
 use partition::cache::PartitionInfoCacheRef;
 use partition::manager::PartitionRuleManager;
 use pipeline::pipeline_operator::PipelineOperator;
@@ -73,6 +77,7 @@ pub struct FrontendBuilder {
     local_cache_invalidator: Option<CacheInvalidatorRef>,
     catalog_manager: CatalogManagerRef,
     node_manager: NodeManagerRef,
+    write_retry_clients: Option<Arc<NodeClients>>,
     plugins: Option<Plugins>,
     procedure_executor: ProcedureExecutorRef,
     process_manager: ProcessManagerRef,
@@ -80,6 +85,7 @@ pub struct FrontendBuilder {
 }
 
 impl FrontendBuilder {
+    /// Creates a frontend builder from its configuration and shared services.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         options: FrontendOptions,
@@ -97,6 +103,7 @@ impl FrontendBuilder {
             local_cache_invalidator: None,
             catalog_manager,
             node_manager,
+            write_retry_clients: None,
             plugins: None,
             procedure_executor,
             process_manager,
@@ -168,6 +175,14 @@ impl FrontendBuilder {
         &self.catalog_manager
     }
 
+    /// Enables write retries through the distributed datanode clients.
+    pub fn with_write_retry_clients(self, clients: Arc<NodeClients>) -> Self {
+        Self {
+            write_retry_clients: Some(clients),
+            ..self
+        }
+    }
+
     pub fn node_manager(&self) -> &NodeManagerRef {
         &self.node_manager
     }
@@ -187,7 +202,11 @@ impl FrontendBuilder {
         }
     }
 
+    /// Validates configuration and assembles the frontend [`Instance`].
     pub async fn try_build(self) -> Result<Instance> {
+        if let Err(reason) = self.options.write_retry.validate() {
+            return error::InvalidWriteRetryConfigSnafu { reason }.fail();
+        }
         let kv_backend = self.kv_backend;
         let node_manager = self.node_manager;
         let plugins = self.plugins.unwrap_or_default();
@@ -214,6 +233,24 @@ impl FrontendBuilder {
             .local_cache_invalidator
             .unwrap_or_else(|| Arc::new(DummyCacheInvalidator));
 
+        let mut write_dispatcher =
+            WriteDispatcher::new(node_manager.clone(), partition_manager.clone());
+        if let Some(clients) = self.write_retry_clients {
+            let table_info_cache: TableInfoCacheRef =
+                self.layered_cache_registry
+                    .get()
+                    .context(error::CacheRequiredSnafu {
+                        name: cache::TABLE_INFO_CACHE_NAME,
+                    })?;
+            write_dispatcher = write_dispatcher.with_retry(
+                clients,
+                self.options.write_retry.clone(),
+                table_info_cache,
+                local_cache_invalidator.clone(),
+            );
+        }
+        let write_dispatcher = Arc::new(write_dispatcher);
+
         let region_query_handler =
             if let Some(factory) = plugins.get::<RegionQueryHandlerFactoryRef>() {
                 factory.build(partition_manager.clone(), node_manager.clone())
@@ -236,6 +273,7 @@ impl FrontendBuilder {
                 table_flownode_cache.clone(),
                 self.options.auto_create_table,
             )
+            .with_write_dispatcher(write_dispatcher.clone())
         };
         // The execution-only inserter owns no batchers, avoiding an Arc cycle.
         let bulk_inserter = Arc::new(create_inserter());
@@ -264,11 +302,14 @@ impl FrontendBuilder {
             create_inserter()
                 .with_pending_rows_batcher(build_batcher(self.options.table_batcher_options())),
         );
-        let deleter = Arc::new(Deleter::new(
-            self.catalog_manager.clone(),
-            partition_manager.clone(),
-            node_manager.clone(),
-        ));
+        let deleter = Arc::new(
+            Deleter::new(
+                self.catalog_manager.clone(),
+                partition_manager.clone(),
+                node_manager.clone(),
+            )
+            .with_write_dispatcher(write_dispatcher),
+        );
         let requester = Arc::new(Requester::new(
             self.catalog_manager.clone(),
             partition_manager.clone(),
